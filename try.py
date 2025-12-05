@@ -13,11 +13,10 @@ import random
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Set
 import signal
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from dataclasses import dataclass, asdict
-from collections import defaultdict, deque
-import statistics
+from collections import defaultdict
+import argparse
 
 @dataclass
 class SiegeResult:
@@ -48,6 +47,8 @@ class SiegeModeTester:
         self.end_time = None
         self.lock = threading.Lock()
         self.fatal_error_detected = threading.Event()
+        self.active_workers = 0
+        self.worker_lock = threading.Lock()
         
         # Signal handling
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -57,6 +58,7 @@ class SiegeModeTester:
         print("\n⚠️  Siege interrupted by user. Stopping...")
         self.running = False
         self.siege_active = False
+        self.fatal_error_detected.set()
     
     def generate_headers(self) -> Dict[str, str]:
         """Generate random HTTP headers to avoid caching."""
@@ -87,106 +89,121 @@ class SiegeModeTester:
         """Worker thread for continuous siege."""
         thread_requests = 0
         
-        while self.running and self.siege_active and not self.fatal_error_detected.is_set():
-            try:
-                # Add cache-busting parameter
-                timestamp = int(time.time() * 1000)
-                siege_url = f"{url}?siege={timestamp}_{thread_id}_{thread_requests}"
-                
-                # Prepare headers
-                headers = self.generate_headers()
-                
-                # Send request with timing
-                start_time = time.time()
-                response = requests.get(
-                    siege_url,
-                    headers=headers,
-                    timeout=config.get('timeout', 10),
-                    verify=config.get('verify_ssl', True)
-                )
-                response_time = time.time() - start_time
-                
-                # Get status code
-                status_code = response.status_code
-                
-                # Check if this is a fatal error
-                fatal_error = self.check_fatal_error(status_code)
-                
-                # Record result
-                with self.lock:
-                    self.total_requests += 1
-                    thread_requests += 1
+        # Register this worker as active
+        with self.worker_lock:
+            self.active_workers += 1
+        
+        try:
+            while self.running and self.siege_active and not self.fatal_error_detected.is_set():
+                try:
+                    # Add cache-busting parameter
+                    timestamp = int(time.time() * 1000)
                     
-                    result = SiegeResult(
-                        timestamp=datetime.now().isoformat(),
-                        request_count=self.total_requests,
-                        status_code=status_code,
-                        response_time=response_time,
-                        thread_id=thread_id,
-                        error=status_code >= 400,
-                        fatal_error=fatal_error
+                    # Check if URL already has query parameters
+                    if '?' in url:
+                        siege_url = f"{url}&siege={timestamp}_{thread_id}_{thread_requests}"
+                    else:
+                        siege_url = f"{url}?siege={timestamp}_{thread_id}_{thread_requests}"
+                    
+                    # Prepare headers
+                    headers = self.generate_headers()
+                    
+                    # Send request with timing
+                    start_time = time.time()
+                    response = requests.get(
+                        siege_url,
+                        headers=headers,
+                        timeout=config.get('timeout', 10),
+                        verify=config.get('verify_ssl', True)
                     )
+                    response_time = time.time() - start_time
                     
-                    self.results.append(result)
-                    self.status_distribution[status_code] += 1
-                    self.response_times.append(response_time)
+                    # Get status code
+                    status_code = response.status_code
                     
-                    if status_code >= 400:
-                        self.error_counts[status_code] += 1
-                
-                # Display result in real-time
-                self.display_request_result(result, thread_requests)
-                
-                # If fatal error detected, stop siege
-                if fatal_error:
-                    print(f"\n🚨 FATAL ERROR DETECTED: Status {status_code}")
-                    print(f"   Thread {thread_id}, Request #{thread_requests}")
+                    # Check if this is a fatal error
+                    fatal_error = self.check_fatal_error(status_code)
+                    
+                    # Record result
+                    with self.lock:
+                        self.total_requests += 1
+                        thread_requests += 1
+                        
+                        result = SiegeResult(
+                            timestamp=datetime.now().isoformat(),
+                            request_count=self.total_requests,
+                            status_code=status_code,
+                            response_time=response_time,
+                            thread_id=thread_id,
+                            error=status_code >= 400,
+                            fatal_error=fatal_error
+                        )
+                        
+                        self.results.append(result)
+                        self.status_distribution[status_code] += 1
+                        self.response_times.append(response_time)
+                        
+                        if status_code >= 400:
+                            self.error_counts[status_code] += 1
+                    
+                    # Display result in real-time
+                    self.display_request_result(result, thread_requests)
+                    
+                    # If fatal error detected, stop siege
+                    if fatal_error:
+                        print(f"\n🚨 FATAL ERROR DETECTED: Status {status_code}")
+                        print(f"   Thread {thread_id}, Request #{thread_requests}")
+                        self.fatal_error_detected.set()
+                        break
+                    
+                    # Dynamic delay based on response time
+                    if response_time > config.get('timeout', 10) * 0.8:
+                        # Slow response, increase delay
+                        delay = config.get('max_delay', 2.0)
+                    elif response_time < 0.1:
+                        # Very fast response, aggressive mode
+                        delay = config.get('min_delay', 0.01)
+                    else:
+                        # Normal operation
+                        delay = config.get('base_delay', 0.1)
+                    
+                    # Add some randomness
+                    delay += random.uniform(-0.02, 0.05)
+                    delay = max(delay, 0.01)
+                    
+                    time.sleep(delay)
+                    
+                except requests.exceptions.RequestException as e:
+                    with self.lock:
+                        self.total_requests += 1
+                        thread_requests += 1
+                        
+                        # Create error result
+                        result = SiegeResult(
+                            timestamp=datetime.now().isoformat(),
+                            request_count=self.total_requests,
+                            status_code=0,
+                            response_time=0,
+                            thread_id=thread_id,
+                            error=True,
+                            fatal_error=True  # Connection errors are fatal
+                        )
+                        
+                        self.results.append(result)
+                        self.error_counts["ConnectionError"] += 1
+                    
+                    print(f"\n🚨 CONNECTION ERROR: {e}")
                     self.fatal_error_detected.set()
                     break
                 
-                # Dynamic delay based on response time
-                if response_time > config.get('timeout', 10) * 0.8:
-                    # Slow response, increase delay
-                    delay = config.get('max_delay', 2.0)
-                elif response_time < 0.1:
-                    # Very fast response, aggressive mode
-                    delay = config.get('min_delay', 0.01)
-                else:
-                    # Normal operation
-                    delay = config.get('base_delay', 0.1)
-                
-                # Add some randomness
-                delay += random.uniform(-0.02, 0.05)
-                delay = max(delay, 0.01)
-                
-                time.sleep(delay)
-                
-            except requests.exceptions.RequestException as e:
-                with self.lock:
-                    self.total_requests += 1
-                    thread_requests += 1
-                    
-                    # Create error result
-                    result = SiegeResult(
-                        timestamp=datetime.now().isoformat(),
-                        request_count=self.total_requests,
-                        status_code=0,
-                        response_time=0,
-                        thread_id=thread_id,
-                        error=True,
-                        fatal_error=True  # Connection errors are fatal
-                    )
-                    
-                    self.results.append(result)
-                    self.error_counts["ConnectionError"] += 1
-                
-                print(f"\n🚨 CONNECTION ERROR: {e}")
-                self.fatal_error_detected.set()
-                break
-            
-            except Exception as e:
-                print(f"\n⚠️ Unexpected error in thread {thread_id}: {e}")
-                time.sleep(1)  # Brief pause on unexpected errors
+                except Exception as e:
+                    print(f"\n⚠️ Unexpected error in thread {thread_id}: {e}")
+                    time.sleep(1)  # Brief pause on unexpected errors
+        
+        finally:
+            # Unregister this worker
+            with self.worker_lock:
+                self.active_workers -= 1
     
     def display_request_result(self, result: SiegeResult, thread_requests: int):
         """Display individual request result with color coding."""
@@ -219,7 +236,7 @@ class SiegeModeTester:
         )
         sys.stdout.flush()
     
-    def display_stats_dashboard(self):
+    def display_stats_dashboard(self, config: Dict):
         """Display real-time statistics dashboard."""
         if not self.results:
             return
@@ -257,27 +274,31 @@ class SiegeModeTester:
                 print(f"Current RPS: {current_rps:.1f}")
                 print(f"Recent Avg Response: {avg_time:.3f}s | Max: {max_time:.3f}s")
                 print(f"Recent Error Rate: {error_rate:.1f}%")
-                print(f"Active Threads: {self.get_active_thread_count()}")
+                print(f"Active Workers: {self.active_workers}/{config['thread_count']}")
                 
                 # Status code distribution
                 print("\nStatus Code Distribution:")
-                for code, count in sorted(self.status_distribution.items()):
+                total_displayed = 0
+                max_display = 8  # Limit displayed status codes to avoid clutter
+                
+                for code, count in sorted(self.status_distribution.items(), key=lambda x: x[1], reverse=True):
+                    if total_displayed >= max_display and code not in self.FATAL_ERROR_CODES:
+                        continue
                     percentage = (count / self.total_requests * 100) if self.total_requests > 0 else 0
-                    bar = "█" * int(percentage / 2)
+                    bar_length = min(int(percentage / 2), 50)
+                    bar = "█" * bar_length
                     print(f"  {code:3d}: {count:6d} [{bar:50}] {percentage:.1f}%")
+                    total_displayed += 1
                 
                 print("="*80)
+                print("Press Ctrl+C to stop the siege")
+                print("="*80)
     
-    def get_active_thread_count(self) -> int:
-        """Get approximate count of active threads."""
-        # This is a simplified version - in production you'd track threads differently
-        return threading.active_count() - 2  # Subtract main thread and stats thread
-    
-    def stats_monitor(self, interval: float = 5.0):
+    def stats_monitor(self, config: Dict):
         """Monitor thread to display periodic statistics."""
         while self.running and self.siege_active and not self.fatal_error_detected.is_set():
-            time.sleep(interval)
-            self.display_stats_dashboard()
+            time.sleep(config.get('stats_interval', 10.0))
+            self.display_stats_dashboard(config)
     
     def run_siege(self, url: str, config: Dict):
         """Execute the siege mode attack."""
@@ -301,7 +322,7 @@ class SiegeModeTester:
         # Start stats monitor thread
         stats_thread = threading.Thread(
             target=self.stats_monitor,
-            args=(config.get('stats_interval', 10.0),),
+            args=(config,),
             daemon=True
         )
         stats_thread.start()
@@ -316,26 +337,30 @@ class SiegeModeTester:
             )
             threads.append(thread)
             thread.start()
+            time.sleep(0.1)  # Stagger thread starts
         
         # Wait for fatal error or manual stop
         try:
             while (self.running and self.siege_active and 
                    not self.fatal_error_detected.is_set()):
-                time.sleep(0.1)
+                time.sleep(0.5)
                 
-                # Check if all threads are dead (unexpected)
-                alive_threads = sum(1 for t in threads if t.is_alive())
-                if alive_threads == 0:
-                    print("\n⚠️  All siege threads stopped unexpectedly!")
-                    break
+                # Check if all workers are dead (unexpected)
+                with self.worker_lock:
+                    if self.active_workers == 0 and self.siege_active:
+                        print("\n⚠️  All siege workers stopped unexpectedly!")
+                        break
+                        
         except KeyboardInterrupt:
             print("\n⚠️  Siege manually stopped by user")
+        except Exception as e:
+            print(f"\n⚠️  Error in main loop: {e}")
         
         # Cleanup
         self.siege_active = False
         self.end_time = datetime.now()
         
-        # Wait for threads to finish
+        # Wait for threads to finish (with timeout)
         for thread in threads:
             thread.join(timeout=2.0)
         
@@ -359,22 +384,28 @@ class SiegeModeTester:
         print(f"  Target URL: {config.get('url', 'Unknown')}")
         print(f"  Siege Duration: {duration:.2f} seconds")
         print(f"  Total Requests: {self.total_requests:,}")
-        print(f"  Average RPS: {self.total_requests / duration:.2f}" if duration > 0 else "  Average RPS: N/A")
+        
+        if duration > 0:
+            print(f"  Average RPS: {self.total_requests / duration:.2f}")
         
         # Response time statistics
-        if self.response_times:
-            valid_times = [t for t in self.response_times if t > 0]
-            if valid_times:
-                print(f"\n⏱️  RESPONSE TIME STATISTICS")
-                print(f"  Fastest: {min(valid_times):.4f}s")
-                print(f"  Slowest: {max(valid_times):.4f}s")
-                print(f"  Average: {sum(valid_times)/len(valid_times):.4f}s")
-                
-                # Calculate percentiles
+        valid_times = [t for t in self.response_times if t > 0]
+        if valid_times:
+            print(f"\n⏱️  RESPONSE TIME STATISTICS")
+            print(f"  Fastest: {min(valid_times):.4f}s")
+            print(f"  Slowest: {max(valid_times):.4f}s")
+            print(f"  Average: {sum(valid_times)/len(valid_times):.4f}s")
+            
+            # Calculate percentiles
+            if len(valid_times) >= 10:
                 sorted_times = sorted(valid_times)
-                p50 = sorted_times[int(len(sorted_times) * 0.5)]
-                p95 = sorted_times[int(len(sorted_times) * 0.95)]
-                p99 = sorted_times[int(len(sorted_times) * 0.99)]
+                p50_idx = int(len(sorted_times) * 0.5)
+                p95_idx = int(len(sorted_times) * 0.95)
+                p99_idx = int(len(sorted_times) * 0.99)
+                
+                p50 = sorted_times[p50_idx] if p50_idx < len(sorted_times) else 0
+                p95 = sorted_times[p95_idx] if p95_idx < len(sorted_times) else 0
+                p99 = sorted_times[p99_idx] if p99_idx < len(sorted_times) else 0
                 
                 print(f"  Median (p50): {p50:.4f}s")
                 print(f"  95th Percentile: {p95:.4f}s")
@@ -420,12 +451,13 @@ class SiegeModeTester:
             if fatal_results:
                 last_fatal = fatal_results[-1]
                 print(f"  🔴 SIEGE STOPPED BY FATAL ERROR")
-                print(f"  Error Type: Status Code {last_fatal.status_code}")
+                if last_fatal.status_code > 0:
+                    print(f"  Error Type: Status Code {last_fatal.status_code}")
+                else:
+                    print(f"  Error Type: Connection Error")
                 print(f"  Occurred at: Request #{last_fatal.request_count:,}")
                 print(f"  Server held for: {duration:.2f} seconds")
                 print(f"  Total requests before failure: {self.total_requests:,}")
-            else:
-                print(f"  🟡 SIEGE STOPPED (Connection Error)")
         else:
             print(f"  🟢 SIEGE MANUALLY STOPPED")
             print(f"  Server withstood siege for: {duration:.2f} seconds")
@@ -549,62 +581,10 @@ def interactive_mode():
     # Save results
     save_results = input("\n💾 Save results to file? (y/n): ").lower() == 'y'
     if save_results:
-        filename = input(f"Filename [default: siege_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json]: ").strip()
-        tester.save_results(filename if filename else None)
-
-def quick_siege_mode():
-    """Quick siege mode with command-line arguments."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(
-        description="HTTP Siege Mode - Continuous load until critical errors",
-        epilog="FOR EDUCATIONAL PURPOSES ONLY"
-    )
-    
-    parser.add_argument('url', help="Target URL to siege")
-    parser.add_argument('-t', '--threads', type=int, default=10,
-                       help="Number of siege threads (default: 10)")
-    parser.add_argument('-d', '--delay', type=float, default=0.05,
-                       help="Base delay between requests in seconds (default: 0.05)")
-    parser.add_argument('-T', '--timeout', type=int, default=30,
-                       help="Request timeout in seconds (default: 30)")
-    parser.add_argument('--min-delay', type=float, default=0.01,
-                       help="Minimum delay between requests (default: 0.01)")
-    parser.add_argument('--max-delay', type=float, default=2.0,
-                       help="Maximum delay between requests (default: 2.0)")
-    parser.add_argument('--no-ssl-verify', action='store_true',
-                       help="Disable SSL certificate verification")
-    parser.add_argument('--output', help="Output filename for results")
-    
-    args = parser.parse_args()
-    
-    tester = SiegeModeTester()
-    
-    config = {
-        'url': args.url,
-        'thread_count': args.threads,
-        'base_delay': args.delay,
-        'min_delay': args.min_delay,
-        'max_delay': args.max_delay,
-        'timeout': args.timeout,
-        'verify_ssl': not args.no_ssl_verify,
-        'stats_interval': 10.0
-    }
-    
-    print(f"\n🚀 Starting quick siege on {args.url}")
-    print(f"   Threads: {args.threads}")
-    print(f"   Delay: {args.delay}s (range: {args.min_delay}s - {args.max_delay}s)")
-    print(f"   SSL Verify: {'Yes' if not args.no_ssl_verify else 'No'}")
-    print(f"   Press Ctrl+C to stop manually\n")
-    
-    tester.run_siege(args.url, config)
-    
-    if args.output:
-        tester.save_results(args.output)
-    else:
-        save = input("\n💾 Save results to file? (y/n): ").lower() == 'y'
-        if save:
-            tester.save_results()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_filename = f"siege_results_{timestamp}.json"
+        filename = input(f"Filename [default: {default_filename}]: ").strip()
+        tester.save_results(filename if filename else default_filename)
 
 def main():
     """Main entry point."""
@@ -621,7 +601,80 @@ def main():
     if choice == '1':
         interactive_mode()
     elif choice == '2':
-        quick_siege_mode()
+        # Use command-line arguments
+        parser = argparse.ArgumentParser(
+            description="HTTP Siege Mode - Continuous load until critical errors",
+            epilog="FOR EDUCATIONAL PURPOSES ONLY"
+        )
+        
+        parser.add_argument('url', help="Target URL to siege")
+        parser.add_argument('-t', '--threads', type=int, default=10,
+                          help="Number of siege threads (default: 10)")
+        parser.add_argument('-d', '--delay', type=float, default=0.05,
+                          help="Base delay between requests in seconds (default: 0.05)")
+        parser.add_argument('-T', '--timeout', type=int, default=30,
+                          help="Request timeout in seconds (default: 30)")
+        parser.add_argument('--min-delay', type=float, default=0.01,
+                          help="Minimum delay between requests (default: 0.01)")
+        parser.add_argument('--max-delay', type=float, default=2.0,
+                          help="Maximum delay between requests (default: 2.0)")
+        parser.add_argument('--no-ssl-verify', action='store_true',
+                          help="Disable SSL certificate verification")
+        parser.add_argument('-s', '--stats-interval', type=float, default=10.0,
+                          help="Statistics update interval in seconds (default: 10)")
+        parser.add_argument('-o', '--output', help="Output filename for results")
+        
+        # Parse arguments from sys.argv if running from menu
+        if len(sys.argv) > 1:
+            args = parser.parse_args()
+        else:
+            # Get arguments interactively
+            url = input("Enter target URL: ").strip()
+            if not url:
+                print("URL is required!")
+                sys.exit(1)
+            
+            # Set default args
+            args = argparse.Namespace(
+                url=url,
+                threads=10,
+                delay=0.05,
+                timeout=30,
+                min_delay=0.01,
+                max_delay=2.0,
+                no_ssl_verify=False,
+                stats_interval=10.0,
+                output=None
+            )
+        
+        tester = SiegeModeTester()
+        
+        config = {
+            'url': args.url,
+            'thread_count': args.threads,
+            'base_delay': args.delay,
+            'min_delay': args.min_delay,
+            'max_delay': args.max_delay,
+            'timeout': args.timeout,
+            'verify_ssl': not args.no_ssl_verify,
+            'stats_interval': args.stats_interval
+        }
+        
+        print(f"\n🚀 Starting quick siege on {args.url}")
+        print(f"   Threads: {args.threads}")
+        print(f"   Delay: {args.delay}s (range: {args.min_delay}s - {args.max_delay}s)")
+        print(f"   SSL Verify: {'Yes' if not args.no_ssl_verify else 'No'}")
+        print(f"   Press Ctrl+C to stop manually\n")
+        
+        tester.run_siege(args.url, config)
+        
+        if args.output:
+            tester.save_results(args.output)
+        else:
+            save = input("\n💾 Save results to file? (y/n): ").lower() == 'y'
+            if save:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                tester.save_results(f"siege_results_{timestamp}.json")
     elif choice == '3':
         print("Exiting...")
         sys.exit(0)
